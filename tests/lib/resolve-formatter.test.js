@@ -109,12 +109,20 @@ function runTests() {
   });
 
   run('findProjectRoot: returns startDir when no package.json', () => {
-    const root = makeTmpDir();
+    // On Windows, env:TMP/TEMP point to AppData\Local\Temp which is under
+    // C:\Users\<user>\ — and C:\Users\<user>\package.json often exists.
+    // Use C:\Windows\Temp (system temp, never under a user home) for isolation.
+    const sysTmp = process.platform === 'win32'
+      ? 'C:\\Windows\\Temp'
+      : '/tmp';
+    const root = fs.mkdtempSync(path.join(sysTmp, path.sep + 'resolve-fmt-'));
     const sub = path.join(root, 'deep');
     fs.mkdirSync(sub, { recursive: true });
 
-    // No package.json anywhere in tmp → falls back to startDir
+    // No package.json in this isolated tree — must return sub unchanged
     assert.strictEqual(findProjectRoot(sub), sub);
+
+    fs.rmSync(root, { recursive: true, force: true });
   });
 
   run('findProjectRoot: caches result for same startDir', () => {
