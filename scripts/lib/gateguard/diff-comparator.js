@@ -14,7 +14,8 @@ class DiffComparator {
       file: /(?:modify|change|update|delete|add|remove)\s+(\S+\.(?:js|md|json|yml))/gi,
       function: /(?:modify|change|update|fix)\s+(\w+)\s+(?:function|method)/gi,
       field: /(?:modify|change|update|remove|delete)\s+(\w+)\s+(?:field|property|export)/gi,
-      impact: /(?:impact|affect)\s+(.+?)(?:\.|$)/gi
+      impact: /(?:impact|affect)\s+(.+?)(?:\.|$)/gi,
+      destructiveCommand: /(?:git\s+(?:reset\s+--hard|checkout\s+--|restore\s+--)|rm\s+-rf|chmod\s+777|chown\s+-R)/gi
     };
   }
 
@@ -26,11 +27,15 @@ class DiffComparator {
       files: [],
       functions: [],
       fields: [],
-      impacts: []
+      impacts: [],
+      containsDestructiveCommands: false
     };
 
-    // 提取声明的文件
+    // 检查破坏性命令
+    declared.containsDestructiveCommands = this.declarationPatterns.destructiveCommand.test(declarationText);
+
     let match;
+    // 提取声明的文件
     while ((match = this.declarationPatterns.file.exec(declarationText)) !== null) {
       declared.files.push(match[1]);
     }
@@ -72,8 +77,11 @@ class DiffComparator {
     for (const line of lines) {
       // 识别变更文件
       if (line.startsWith('diff --git')) {
-        currentFile = line.split(' b/')[1];
-        if (currentFile) actual.modifiedFiles.push(currentFile);
+        const parts = line.split(' b/');
+        if (parts.length === 2) {
+          currentFile = parts[1].trim();
+          actual.modifiedFiles.push(currentFile);
+        }
         continue;
       }
 
@@ -99,12 +107,12 @@ class DiffComparator {
       if (line.startsWith('+function ') || line.startsWith('+ function ')) {
         const fn = line.match(/function\s+(\w+)/);
         if (fn) {
-          const existing = actual.deletedFunctions.find(d => 
+          const existingIndex = actual.deletedFunctions.findIndex(d => 
             d.file === currentFile && d.function === fn[1]
           );
-          if (existing) {
+          if (existingIndex !== -1) {
             actual.changedSignatures.push({ file: currentFile, function: fn[1] });
-            actual.deletedFunctions = actual.deletedFunctions.filter(d => d !== existing);
+            actual.deletedFunctions.splice(existingIndex, 1);
           }
         }
       }
@@ -117,13 +125,29 @@ class DiffComparator {
    * 对比声明与实际变更
    */
   compare(declarationText, diffContent) {
+    // 输入边界验证
+    if (typeof declarationText !== 'string') {
+      throw new TypeError('declarationText must be a string');
+    }
+    if (typeof diffContent !== 'string') {
+      throw new TypeError('diffContent must be a string');
+    }
+    if (declarationText.length === 0 && diffContent.length === 0) {
+      return { declared: {}, actual: {}, discrepancies: [], matchRate: 1.0 };
+    }
+
     const declared = this.parseDeclaration(declarationText);
     const actual = this.analyzeActualDiff(diffContent);
     const discrepancies = [];
 
+    // O(1) 查找集合预构建 - 替换 O(N×M) 操作
+    const declaredFieldsSet = new Set(declared.fields);
+    const declaredFunctionsSet = new Set(declared.functions);
+
     // 检查未声明的文件变更
     actual.modifiedFiles.forEach(file => {
-      if (!declared.files.some(f => file.includes(f))) {
+      const fileDeclared = declared.files.some(f => file.includes(f));
+      if (!fileDeclared) {
         discrepancies.push({
           type: 'undeclared_file',
           severity: 'low',
@@ -135,7 +159,8 @@ class DiffComparator {
 
     // 检查未声明的导出删除
     actual.deletedExports.forEach(({ file, field }) => {
-      if (!declared.fields.includes(field) && !declared.files.some(f => file.includes(f))) {
+      const fileDeclared = declared.files.some(f => file.includes(f));
+      if (!declaredFieldsSet.has(field) && !fileDeclared) {
         discrepancies.push({
           type: 'undeclared_export_delete',
           severity: 'high',
@@ -148,7 +173,8 @@ class DiffComparator {
 
     // 检查未声明的函数签名变更
     actual.changedSignatures.forEach(({ file, function: fn }) => {
-      if (!declared.functions.includes(fn) && !declared.files.some(f => file.includes(f))) {
+      const fileDeclared = declared.files.some(f => file.includes(f));
+      if (!declaredFunctionsSet.has(fn) && !fileDeclared) {
         discrepancies.push({
           type: 'undeclared_signature_change',
           severity: 'medium',
@@ -161,7 +187,8 @@ class DiffComparator {
 
     // 检查未声明的函数删除
     actual.deletedFunctions.forEach(({ file, function: fn }) => {
-      if (!declared.functions.includes(fn) && !declared.files.some(f => file.includes(f))) {
+      const fileDeclared = declared.files.some(f => file.includes(f));
+      if (!declaredFunctionsSet.has(fn) && !fileDeclared) {
         discrepancies.push({
           type: 'undeclared_function_delete',
           severity: 'high',
@@ -176,14 +203,14 @@ class DiffComparator {
       declared,
       actual,
       discrepancies,
-      matchRate: this.calculateMatchRate(declared, actual)
+      matchRate: this.calculateMatchRate(declared, actual, declaredFieldsSet, declaredFunctionsSet)
     };
   }
 
   /**
    * 计算声明与实际的匹配度
    */
-  calculateMatchRate(declared, actual) {
+  calculateMatchRate(declared, actual, declaredFieldsSet, declaredFunctionsSet) {
     let total = 0;
     let matches = 0;
 
@@ -191,10 +218,10 @@ class DiffComparator {
     matches += actual.modifiedFiles.filter(f => declared.files.some(d => f.includes(d))).length;
 
     total += actual.deletedExports.length;
-    matches += actual.deletedExports.filter(e => declared.fields.includes(e.field)).length;
+    matches += actual.deletedExports.filter(e => declaredFieldsSet.has(e.field)).length;
 
     total += actual.changedSignatures.length;
-    matches += actual.changedSignatures.filter(s => declared.functions.includes(s.function)).length;
+    matches += actual.changedSignatures.filter(s => declaredFunctionsSet.has(s.function)).length;
 
     return total > 0 ? matches / total : 1.0;
   }
